@@ -1,14 +1,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "driver/gpio.h"
+#include "esp32/rom/ets_sys.h"
 
+// Declaring I/O pins
+#define DIGITAL_PIN GPIO_NUM_8
 #define LED_PIN 10
-#define INPUT_PIN_1 5
-#define INPUT_PIN_2 6
-#define ANALOG_PIN 4
-#define PUSH_BUTTON 2
-
+#define INPUT_PIN_1 1
+#define INPUT_PIN_2 3
+#define ANALOG_PIN  19
+#define BUTTON_PIN 2
+#define ERR_PIN 18
 #define DEBOUNCE_TIME 50
+
 //store the data collected from task 2 & 3
 typedef struct
 {
@@ -17,126 +22,142 @@ typedef struct
 }FrequencyData;
 
 FrequencyData freq_data;
-//semaphore to protect access to the frequency data structure
+
+// Semaphore to protect access to the frequency data structure
 SemaphoreHandle_t frequencySemaphore;
 
-//task handles
+// Queue for botto press events
+QueueHandle_t buttonEventQueue;
+
+// Task handles
 TaskHandle_t Task1Handle, Task2Handle, Task3Handle, Task4Handle, Task5Handle, Task6Handle, Task7Handle, Task8Handle;
 
 void setup() {
   // put your setup code here, to run once:
+  // Initialise serial communication with the 96-- baud rate
   Serial.begin(9600);
   Serial.println(F("In Setup function"));
 
-  // led
+  // Digital signal
+  pinMode(DIGITAL_PIN, OUTPUT);
+  // Analog input
+  pinMode(ANALOG_PIN, INPUT);
+  // LED
   pinMode(LED_PIN, OUTPUT);
-  // button
-  pinMode(PUSH_BUTTON, INPUT_PULLUP);
+  pinMode(ERR_PIN, OUTPUT);
+  // Push button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  buttonEventQueue = xQueueCreate(1, sizeof(uint8_t));
 
+  // Create semaphore
   frequencySemaphore = xSemaphoreCreateMutex();
   if(frequencySemaphore == NULL)
   {
     Serial.println("Semaphore creation failed.");
   }
 
-  //create tasks(function name, name, capacity of stack, NULL, priority, task handle)
-  xTaskCreate(Task1, "Task1", 2048, NULL, 1, &Task1Handle);
-  xTaskCreate(Task2, "Task2", 2048, NULL, 2, &Task2Handle);
-  xTaskCreate(Task3, "Task3", 2048, NULL, 3, &Task3Handle);
-  xTaskCreate(Task4, "Task4", 2048, NULL, 4, &Task4Handle);
-  xTaskCreate(Task5, "Task5", 2048, NULL, 5, &Task5Handle);
-  // xTaskCreate(Task6, "Task6", 2048, NULL, 6, &Task6Handle);
-  xTaskCreate(Task7, "Task7", 2048, NULL, 7, &Task7Handle);
-  xTaskCreate(periodicTask, "Task8", 2048, NULL, 8, &Task8Handle);
+  // Create tasks(function name, name, capacity of stack, NULL, priority, task handle)
+  xTaskCreate(digitalSignal, "Task1", 1640, NULL, 1, &Task1Handle);
+  xTaskCreate(freqMeasure1, "Task2", 1680, NULL, 5, &Task2Handle);
+  xTaskCreate(freqMeasure2, "Task3", 1900, NULL, 5, &Task3Handle);
+  xTaskCreate(analogRead, "Task4", 1640, NULL, 2, &Task4Handle);
+  xTaskCreate(freqDisplay, "Task5", 1900, NULL, 2, &Task5Handle);
+  xTaskCreate(monitorButton, "Task6", 1608, NULL, 3, &Task6Handle);
+  xTaskCreate(controlLED, "Task7", 1648, NULL, 3, &Task7Handle);
+  xTaskCreate(periodicTask, "Task8", 1660, NULL, 2, &Task8Handle);
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-
+  // Since it is RTOs, the loop function is not used.
 }
 
-void Task1(void* pvParameters)
+void digitalSignal(void* pvParameters)
 {
+  // Use gpio to control the digital output, since is more sensitive to high real-time performance task
+  gpio_pad_select_gpio(DIGITAL_PIN);
+  gpio_set_direction(DIGITAL_PIN, GPIO_MODE_OUTPUT);
   while(1)
   {
-    digitalWrite(LED_PIN, HIGH);
-    Serial.println(F("Task1"));
-    vTaskDelay(0.18/portTICK_PERIOD_MS); //delay 180us
-    digitalWrite(LED_PIN, LOW);
-    vTaskDelay(0.04/portTICK_PERIOD_MS); //delay 40us
-    digitalWrite(LED_PIN, HIGH);
-    vTaskDelay(0.53/portTICK_PERIOD_MS); //delay 530us
-    digitalWrite(LED_PIN, LOW);
-    vTaskDelay(3.25/portTICK_PERIOD_MS); //delay 3.25ms
+    // digitalWrite(DIGITAL_PIN, HIGH);
+    gpio_set_level(DIGITAL_PIN, 1);
+    ets_delay_us(180); // Use 
+    gpio_set_level(DIGITAL_PIN, 0);
+    ets_delay_us(40);
+    gpio_set_level(DIGITAL_PIN, 1);
+    ets_delay_us(530);
+    gpio_set_level(DIGITAL_PIN, 0);
+    ets_delay_us(3250);
   }
+
 }
 
 //task2 & 3
-volatile unsigned long lastTime_task2 = 0; // 上次信号变化的时间
-volatile unsigned long lastFrequency_task2 = 0; // 最近一次计算的频率
+volatile unsigned long lastTime_task2 = 0; // last changing time
+volatile unsigned long lastFrequency_task2 = 0; // last frequency
 
 void IRAM_ATTR handleInterrupt_task2() {
-    unsigned long currentTime = micros(); // 获取当前时间
-    unsigned long interval = currentTime - lastTime_task2; // 计算时间间隔
+    unsigned long currentTime = micros(); // get current time
+    unsigned long interval = currentTime - lastTime_task2; // calculate the interval
 
-    if (interval > 0) { // 避免除以零
-        lastFrequency_task2 = 1000000 / interval; // 计算频率（Hz）
+    if (interval > 0) { 
+        lastFrequency_task2 = 1000000 / interval; // calculate frequency
     }
 
-    lastTime_task2 = currentTime; // 更新上次变化的时间
+    lastTime_task2 = currentTime; // upload changing time
 }
 
-void Task2(void *pvParameters) {
+void freqMeasure1(void *pvParameters) {
   pinMode(INPUT_PIN_1, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(INPUT_PIN_1), handleInterrupt_task2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(INPUT_PIN_1), handleInterrupt_task2, RISING);
 
   while(1)
   {
     if (xSemaphoreTake(frequencySemaphore, portMAX_DELAY) == pdTRUE) 
     {
-      freq_data.freq_task2 = lastFrequency_task2; // 从中断服务程序更新频率值
-      xSemaphoreGive(frequencySemaphore); // 释放信号量
+      freq_data.freq_task2 = lastFrequency_task2; // upload the frequency from interrupt
+      xSemaphoreGive(frequencySemaphore); 
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // 保持任务同步，每20毫秒更新一次
+    vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
 
-volatile unsigned long lastTime_task3 = 0; // 上次信号变化的时间
-volatile unsigned long lastFrequency_task3 = 0; // 最近一次计算的频率
+volatile unsigned long lastTime_task3 = 0;
+volatile unsigned long lastFrequency_task3 = 0; 
 
 void IRAM_ATTR handleInterrupt_task3() {
-    unsigned long currentTime = micros(); // 获取当前时间
-    unsigned long interval = currentTime - lastTime_task3; // 计算时间间隔
+    unsigned long currentTime = micros(); 
+    unsigned long interval = currentTime - lastTime_task3;
 
-    if (interval > 0) { // 避免除以零
-        lastFrequency_task3 = 1000000 / interval; // 计算频率（Hz）
+    if (interval > 0) { 
+        lastFrequency_task3 = 1000000 / interval; 
     }
 
-    lastTime_task3 = currentTime; // 更新上次变化的时间
+    lastTime_task3 = currentTime;
 }
 
-void Task3(void *pvParameters) 
+void freqMeasure2(void *pvParameters) 
 {
   pinMode(INPUT_PIN_2, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(INPUT_PIN_2), handleInterrupt_task3, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(INPUT_PIN_2), handleInterrupt_task3, RISING);
 
   while(1)
   {
     if (xSemaphoreTake(frequencySemaphore, portMAX_DELAY) == pdTRUE) 
     {
-      freq_data.freq_task3 = lastFrequency_task3; // 从中断服务程序更新频率值
-      xSemaphoreGive(frequencySemaphore); // 释放信号量
+      freq_data.freq_task3 = lastFrequency_task3; 
+      xSemaphoreGive(frequencySemaphore); 
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // 调整为与task2相同的延时以保持一致性
+    vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
 
-void Task4(void* pvParameters)
+void analogRead(void* pvParameters)
 {
-  int readings[10] = {0};
+  float readings[10] = {0};
   int readIndex = 0;
-  long total = 0;
-  long average = 0;
+  float total = 0;
+  float average = 0;
   while(1)
   {
     total -= readings[readIndex]; //deposit the oldest reading
@@ -147,12 +168,13 @@ void Task4(void* pvParameters)
     average = total / 10; // calculate the average
 
     if (average > 2047) {
-        digitalWrite(LED_PIN, HIGH); // if reach half of miximum, light on
+        digitalWrite(ERR_PIN, HIGH); // if reach half of maximum, light on
     } else {
-        digitalWrite(LED_PIN, LOW); // or swith off the led
+        digitalWrite(ERR_PIN, LOW); // or swith off the led
     }
 
-    vTaskDelay(20/portTICK_PERIOD_MS); // delay 20ms
+    vTaskDelay(pdMS_TO_TICKS(20)); // delay 20ms
+    // Serial.printf("Input Voltage avg(in V): %.2f \n",average);
   }
 }
 
@@ -162,13 +184,9 @@ int scale_frequency(int freq, int lower_bound, int upper_bound)
 {
   if(freq <=  lower_bound) return 0;
   if (freq >= upper_bound) return 99;
-  return (freq - lower_bound) * 99 / (upper_bound - lower_bound);
+  else return ((freq - lower_bound) * 99 / (upper_bound - lower_bound));
 }
-void log_frequencies(int freq_task2, int freq_task3) {
-    scaled_freq2 = scale_frequency(freq_task2, 333, 1000); // 任务2的缩放
-    scaled_freq3 = scale_frequency(freq_task3, 500, 1000); // 任务3的缩放
-}
-void Task5(void* pvParameters)
+void freqDisplay(void* pvParameters)
 {
   while(1)
   {
@@ -184,14 +202,14 @@ void Task5(void* pvParameters)
       Serial.print(scaled_freq2);
       Serial.print(", Task 3 Frequency: ");
       Serial.println(scaled_freq3);
-      xSemaphoreGive(frequencySemaphore); // 在打印之后释放信号量
+      xSemaphoreGive(frequencySemaphore);
 
     }
-    vTaskDelay(200/portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
-void Task7(void* pvParameters)
+void monitorButton(void* pvParameters)
 {
   int buttonState = HIGH; // current state
   int lastButtonState = HIGH; // last state
@@ -212,15 +230,30 @@ void Task7(void* pvParameters)
 
         // if button is pressed, switch the state of LED
         if (buttonState == LOW) {
-          digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+          uint8_t event = 1;
+          xQueueSend(buttonEventQueue, &event, portMAX_DELAY);
         }
       }
     }
 
     lastButtonState = readButton;
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
+void controlLED(void* pvParameters) {
+  uint8_t event;
+  pinMode(LED_PIN, OUTPUT);
+
+  while (1) {
+    // Receive button state from queue
+    if (xQueueReceive(buttonEventQueue, &event, portMAX_DELAY) == pdTRUE) {
+      // Switch LED state
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
+  }
+}
+
 
 void CPU_work(int time)
 {
@@ -237,6 +270,6 @@ void periodicTask(void *pvParameters)
   while(1)
   {
     CPU_work(2);
-    vTaskDelay(20/portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
